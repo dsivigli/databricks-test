@@ -14,6 +14,7 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 2
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -248,3 +249,12 @@ dim_customer.write.mode("overwrite").saveAsTable("dim_customer")
 dim_promotion.write.mode("overwrite").saveAsTable("dim_promotion")
 fact_sales.write.mode("overwrite").partitionBy("transaction_date").saveAsTable("fact_sales")
 enriched_sales.write.mode("overwrite").partitionBy("transaction_date").saveAsTable("fact_sales_enriched")
+
+# COMMAND ----------
+
+display(spark.table("dim_store"))
+display(spark.table("dim_product"))
+display(spark.table("dim_customer"))
+display(spark.table("dim_promotion"))
+display(spark.table("fact_sales"))
+display(spark.table("fact_sales_enriched"))
