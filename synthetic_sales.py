@@ -48,21 +48,21 @@ dim_store = (
         "country",
         F.element_at(
             F.array(F.lit("US"), F.lit("CA"), F.lit("MX"), F.lit("UK"), F.lit("DE"), F.lit("FR"), F.lit("JP")),
-            (F.pmod(F.hash("store_id"), F.lit(7)) + F.lit(1))% NUM_STORES + 1
+            (F.pmod(F.hash("store_id"), F.lit(7)) + F.lit(1)).cast("int"),
         ),
     )
     .withColumn(
         "region",
         F.element_at(
             F.array(F.lit("North"), F.lit("South"), F.lit("East"), F.lit("West"), F.lit("Central")),
-            (F.pmod(F.hash(F.col("store_id"), F.lit("region")), F.lit(5)) + F.lit(1))% NUM_STORES + 1
+            (F.pmod(F.hash(F.col("store_id"), F.lit("region")), F.lit(5)) + F.lit(1)).cast("int"),
         ),
     )
     .withColumn(
         "store_type",
         F.element_at(
             F.array(F.lit("flagship"), F.lit("standard"), F.lit("outlet"), F.lit("popup")),
-            (F.pmod(F.hash(F.col("store_id"), F.lit("type")), F.lit(4)) + F.lit(1))% NUM_STORES + 1
+            (F.pmod(F.hash(F.col("store_id"), F.lit("type")), F.lit(4)) + F.lit(1)).cast("int"),
         ),
     )
 )
@@ -87,7 +87,7 @@ dim_product = (
                 F.lit("electronics"), F.lit("apparel"), F.lit("grocery"), F.lit("home"),
                 F.lit("toys"), F.lit("beauty"), F.lit("sports"), F.lit("books"),
             ),
-            (F.pmod(F.hash("product_id"), F.lit(8)) + F.lit(1))% NUM_PRODUCTS + 1
+            (F.pmod(F.hash("product_id"), F.lit(8)) + F.lit(1)).cast("int"),
         ),
     )
     .withColumn(
@@ -118,7 +118,7 @@ dim_customer = (
         "loyalty_tier",
         F.element_at(
             F.array(F.lit("bronze"), F.lit("silver"), F.lit("gold"), F.lit("platinum")),
-            (F.pmod(F.hash("customer_id"), F.lit(4)) + F.lit(1))% NUM_CUSTOMERS + 1
+            (F.pmod(F.hash("customer_id"), F.lit(4)) + F.lit(1)).cast("int"),
         ),
     )
     .withColumn(
@@ -143,7 +143,7 @@ dim_promotion = (
         "promotion_type",
         F.element_at(
             F.array(F.lit("bogo"), F.lit("percent_off"), F.lit("flat_off"), F.lit("clearance"), F.lit("loyalty")),
-            (F.pmod(F.hash("promotion_id"), F.lit(5)) + F.lit(1)) %NUM_PROMOTIONS+1
+            (F.pmod(F.hash("promotion_id"), F.lit(5)) + F.lit(1)).cast("int"),
         ),
     )
     .withColumn("discount_pct", F.round((F.rand(seed=22) * F.lit(0.5)).cast("double"), 3))
