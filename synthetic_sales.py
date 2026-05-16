@@ -27,13 +27,21 @@ from pyspark.sql.functions import broadcast
 spark = SparkSession.builder.appName("synthetic_sales").getOrCreate()
 
 # Row counts.
-# Dimensions are intentionally tiny so they fit comfortably under the broadcast-join threshold
-# (default spark.sql.autoBroadcastJoinThreshold = 10MB). All four dim tables together are <1MB serialized,
-# so every fact->dim join becomes a map-side broadcast join — zero shuffle.
+# Three dims (store, product, promotion) are intentionally tiny — they fit under the
+# broadcast-join threshold (default spark.sql.autoBroadcastJoinThreshold = 10MB) and become
+# map-side broadcast joins with zero shuffle on the fact side.
+# dim_customer is the EXCEPTION: at 200M rows × ~30 bytes ≈ 6GB serialized, it's far too
+# large to broadcast. Any fact->customer join must use SortMergeJoin (both sides shuffled
+# by customer_id). See section 6 for the strategy change and metrics.ipynb for a demo.
 NUM_STORES = 200
 NUM_PRODUCTS = 5_000
-NUM_CUSTOMERS = 100_000
+NUM_CUSTOMERS = 200_000_000
 NUM_PROMOTIONS = 50
+
+# Partition count for dim_customer generation: 200M / 500K per partition = 400. Same sizing
+# rationale as the fact table — partitions large enough to amortize task overhead, small
+# enough to avoid GC pressure.
+CUSTOMER_NUM_PARTITIONS = 400
 
 # Fact table at 100M rows.
 NUM_TRANSACTIONS = 100_000_000
@@ -128,18 +136,28 @@ dim_product = (
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. `dim_customer`
+# MAGIC ## 3. `dim_customer` — 200M rows (NOT broadcastable)
 # MAGIC
 # MAGIC `signup_date` is built by adding a deterministic day offset (0–2919, ~8 years) to a base date.
 # MAGIC
-# MAGIC **Perf:** 100K rows is still well under the broadcast threshold (~3MB). We use 2 partitions
-# MAGIC purely to parallelize generation across two cores — the table coalesces back during the
-# MAGIC broadcast collect, so partition count here doesn't affect the join plan.
+# MAGIC **Perf at 200M-row scale:**
+# MAGIC
+# MAGIC - **No broadcast.** At ~30 bytes/row × 200M rows ≈ 6GB serialized, this dim is ~600x the
+# MAGIC   default broadcast threshold (10MB). Forcing `broadcast()` here would OOM the driver during
+# MAGIC   the broadcast `collect`, then OOM every executor that tried to hold the hash table.
+# MAGIC - **Partitioned generation.** 400 partitions ≈ 500K rows/task — same sweet spot as the fact.
+# MAGIC - **Bucketing on `customer_id`** (see write-out below). This is the key optimization for the
+# MAGIC   fact↔customer join: bucketing both tables on the join key eliminates the customer-side
+# MAGIC   shuffle of a SortMergeJoin, since matching keys are already co-located by file.
+# MAGIC
+# MAGIC **Why generation cost matters less than join cost:** generation is a single linear stage —
+# MAGIC 400 narrow tasks compute and write in parallel, no shuffle. The expensive operation downstream
+# MAGIC is the join, which is where bucketing earns its keep.
 
 # COMMAND ----------
 
 dim_customer = (
-    spark.range(1, NUM_CUSTOMERS + 1, step=1, numPartitions=2)
+    spark.range(1, NUM_CUSTOMERS + 1, step=1, numPartitions=CUSTOMER_NUM_PARTITIONS)
     .withColumnRenamed("id", "customer_id")
     .withColumn(
         "loyalty_tier",
@@ -264,14 +282,22 @@ fact_sales = (
 # MAGIC    `store_type` — dropping `store_id` from the projection keeps the join key but trims the
 # MAGIC    broadcast payload. Same idea for the other dims. Smaller broadcasts = less serialization,
 # MAGIC    less network, less executor memory pressure.
-# MAGIC 2. **Explicit `broadcast(...)` hints.** Even though dims are well under the auto-broadcast
-# MAGIC    threshold, the hint is defensive: if a future change pushes a dim past the threshold, the
-# MAGIC    plan would silently degrade to a sort-merge join (full shuffle of the 100M-row fact). The
-# MAGIC    hint forces a broadcast hash join and surfaces the problem as an OOM instead of silent
-# MAGIC    slowdown.
-# MAGIC 3. **`LEFT` joins.** Defensive — keep every fact row even if a key is unexpectedly missing.
+# MAGIC 2. **Mixed join strategies — broadcast for tiny dims, SortMergeJoin for `dim_customer`.**
+# MAGIC    `dim_store` / `dim_product` / `dim_promotion` are all <1MB → `broadcast()` hints force a
+# MAGIC    BroadcastHashJoin (no fact-side shuffle). `dim_customer` at 200M rows ≈ 6GB CANNOT be
+# MAGIC    broadcast — we'd OOM the driver collect and the executor heap. Instead we let Catalyst
+# MAGIC    pick SortMergeJoin (both sides shuffled and sorted by `customer_id`). Crucially, both
+# MAGIC    `fact_sales` and `dim_customer` are **bucketed on `customer_id`** at write time (see
+# MAGIC    section 7), which lets the SortMergeJoin skip the shuffle/sort phase entirely on subsequent
+# MAGIC    reads — files already co-locate matching keys.
+# MAGIC 3. **The defensive `broadcast()` hint logic still applies for the small dims.** If a future
+# MAGIC    change pushes one of them past the auto-broadcast threshold, the plan would silently
+# MAGIC    degrade to a SortMergeJoin (full shuffle of the 100M-row fact). The hint forces a broadcast
+# MAGIC    hash join and surfaces the problem as an OOM instead of silent slowdown. We deliberately
+# MAGIC    do NOT broadcast `dim_customer` — it is *known* to be too large.
+# MAGIC 4. **`LEFT` joins.** Defensive — keep every fact row even if a key is unexpectedly missing.
 # MAGIC    Only `promotion_id` is legitimately nullable.
-# MAGIC 4. **All numeric columns derived in one pass.** `gross_revenue`, `discount_amount`,
+# MAGIC 5. **All numeric columns derived in one pass.** `gross_revenue`, `discount_amount`,
 # MAGIC    `net_revenue`, `cost`, `gross_margin` are all computed in a single projection. Spark's
 # MAGIC    Catalyst optimizer collapses chained `withColumn` calls into one project node anyway,
 # MAGIC    but keeping them in one block makes the dependency chain explicit to readers.
@@ -292,7 +318,11 @@ enriched_sales = (
     fact_sales.alias("f")
     .join(broadcast(dim_store_min).alias("s"), "store_id", "left")
     .join(broadcast(dim_product_min).alias("p"), "product_id", "left")
-    .join(broadcast(dim_customer_min).alias("c"), "customer_id", "left")
+    # NO broadcast() on dim_customer — it's 6GB. Catalyst will pick SortMergeJoin here.
+    # Once both sides are read from their bucketed-on-customer_id Delta tables (section 7),
+    # the SMJ can use the bucketing to skip the shuffle phase: matching keys are already
+    # co-located by file, so the join becomes a streaming sort-merge across pre-sorted partitions.
+    .join(dim_customer_min.alias("c"), "customer_id", "left")
     .join(broadcast(dim_promotion_min).alias("pr"), "promotion_id", "left")
     # Single projection block — Catalyst fuses these into one Project node.
     # `coalesce(discount_pct, 0)` so unpromoted transactions (NULL discount) get full price math.
@@ -311,55 +341,103 @@ enriched_sales = (
 # MAGIC %md
 # MAGIC ## 7. Persist as Delta tables
 # MAGIC
-# MAGIC **`fact_sales` is partitioned by `transaction_date`** (365 daily partitions across CY2024).
-# MAGIC Date-range filters in the metrics notebook will partition-prune, reading only the days they need.
+# MAGIC **`fact_sales` is partitioned by `transaction_date`** (365 daily partitions across CY2024)
+# MAGIC AND **bucketed by `customer_id`** into `NUM_BUCKETS` files per date partition. `dim_customer`
+# MAGIC is bucketed identically. This is the key change driven by the 200M-row dim_customer.
 # MAGIC
-# MAGIC **Perf rules applied to the write:**
+# MAGIC **Why bucket on `customer_id`:** the fact↔dim_customer SortMergeJoin would otherwise need to
+# MAGIC shuffle BOTH the 100M-row fact AND the 200M-row dim by `customer_id` on every read — that's
+# MAGIC ~10–15GB of shuffle for the fact + ~6GB for the dim, every single query. Bucketing both
+# MAGIC tables on the same key, into the same number of buckets, with the same hash function, lets
+# MAGIC Spark recognize at plan time that matching keys are already co-located. The join plan changes
+# MAGIC from `Exchange → Sort → SortMergeJoin → Exchange → Sort` (per side) to just `SortMergeJoin`
+# MAGIC over pre-bucketed inputs — no shuffle, no sort.
+# MAGIC
+# MAGIC **Choosing `NUM_BUCKETS`:** rule of thumb is bucket count × avg file size ≈ healthy file size
+# MAGIC (~256MB). 200M customer rows × ~30 bytes = 6GB → 6GB / 256MB ≈ 24 buckets. We round to 32
+# MAGIC (a power of two helps the hash partitioner spread evenly). Both tables MUST use the same
+# MAGIC bucket count or Spark falls back to a re-shuffle.
+# MAGIC
+# MAGIC **Other perf rules:**
 # MAGIC
 # MAGIC 1. **`format("delta")`** explicitly — Delta gives us partition pruning, file statistics for
 # MAGIC    data skipping on non-partition columns, and `OPTIMIZE`/`ZORDER` later if needed.
-# MAGIC 2. **`repartition("transaction_date")` before write.** Without this, each of our 200 generation
-# MAGIC    tasks would write to all 365 date partitions, producing 200 × 365 = 73,000 small files.
-# MAGIC    Repartitioning by `transaction_date` collapses each date to a single task, so the write
-# MAGIC    produces ~365 files (one per day) of ~250–300MB each — a healthy file size for Delta.
+# MAGIC 2. **`repartition("transaction_date", "customer_id")` before write.** With bucketing layered
+# MAGIC    on top of date partitioning, we want each writer task to handle exactly one
+# MAGIC    `(transaction_date, bucket)` slot. Repartitioning by both columns aligns the in-memory
+# MAGIC    layout with the on-disk layout and avoids the small-files explosion.
 # MAGIC 3. **`mode("overwrite")` with `overwriteSchema=true`** so re-runs with schema changes don't
 # MAGIC    fail on a column drift between iterations of this notebook.
-# MAGIC 4. **Dimensions write without partitioning** — they're too small to partition meaningfully.
-# MAGIC    A single Delta file per dim is ideal.
+# MAGIC 4. **Small dims (`dim_store`, `dim_product`, `dim_promotion`) write without partitioning or
+# MAGIC    bucketing** — they're tiny enough to broadcast at query time. Bucketing them would be
+# MAGIC    pure overhead.
 
 # COMMAND ----------
 
-# Dimensions: small, single-file Delta writes. No partitioning, no repartitioning needed.
+# DBTITLE 1,Bucketing configuration for customer_id co-location
+# Both fact_sales and dim_customer use the same bucket count on customer_id so SortMergeJoin
+# can skip the shuffle phase on read. Changing this value requires re-writing BOTH tables.
+NUM_BUCKETS = 32
+
+# COMMAND ----------
+
+# Small dims: single-file Delta writes. No partitioning, no bucketing needed.
 (dim_store.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_store"))
 (dim_product.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_product"))
-(dim_customer.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_customer"))
 (dim_promotion.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_promotion"))
 
-# fact_sales: repartition by transaction_date BEFORE write to avoid the 200×365 small-files explosion.
-# This costs one shuffle, but the shuffle is cheap relative to the file-system cost of writing,
-# committing, and later reading 73,000 tiny files.
+# dim_customer: 200M rows, bucketed on customer_id so fact↔customer SMJ can skip the shuffle.
+# Note: Spark's bucketBy is only respected on the Hive metastore path (saveAsTable), not on
+# path-based saves — that's why we use saveAsTable here even though Delta is the file format.
+# Repartitioning by customer_id before the write aligns the in-memory layout with the bucket
+# layout, so each writer task produces exactly one bucket file (no scatter writes).
+(
+    dim_customer
+    .repartition(NUM_BUCKETS, "customer_id")
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .bucketBy(NUM_BUCKETS, "customer_id")
+    .sortBy("customer_id")  # within-bucket sort lets SMJ stream pre-sorted partitions
+    .saveAsTable("dim_customer")
+)
+
+# fact_sales: partition by transaction_date AND bucket by customer_id.
+# Layered partitioning + bucketing: 365 date partitions × 32 customer buckets = 11,680 logical
+# slots. Each slot becomes one Delta file of ~30-40MB (100M rows × ~50 bytes / 11,680). That's
+# on the small side for Delta, but the trade-off is worth it: the alternative is a per-query
+# shuffle of 5-10GB on the customer_id join.
+#
+# Repartitioning by (transaction_date, customer_id) before the write aligns the in-memory
+# layout with the on-disk layout — each task writes to exactly one (date, bucket) slot.
 (
     fact_sales
-    .repartition("transaction_date")
+    .repartition("transaction_date", "customer_id")
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("transaction_date")
+    .bucketBy(NUM_BUCKETS, "customer_id")
+    .sortBy("customer_id")
     .saveAsTable("fact_sales")
 )
 
-# fact_sales_enriched: same partitioning strategy. The metrics notebook reads this table and
-# groups by transaction_date / region / category — date partitioning enables pruning for any
-# date-bounded metric, and Delta's per-file min/max stats handle the rest.
+# fact_sales_enriched: same partition + bucket strategy as fact_sales. The metrics notebook
+# reads this table and groups by transaction_date / region / category / loyalty_tier — date
+# partitioning enables pruning for date-bounded metrics, customer_id bucketing means any
+# downstream join back to dim_customer (or to another customer-keyed table) skips the shuffle.
 (
     enriched_sales
-    .repartition("transaction_date")
+    .repartition("transaction_date", "customer_id")
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("transaction_date")
+    .bucketBy(NUM_BUCKETS, "customer_id")
+    .sortBy("customer_id")
     .saveAsTable("fact_sales_enriched")
 )
 
