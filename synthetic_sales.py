@@ -17,6 +17,7 @@
 # DBTITLE 1,Cell 2
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.functions import broadcast
 
 spark = SparkSession.builder.appName("synthetic_sales").getOrCreate()
 
@@ -218,10 +219,10 @@ fact_sales = (
 
 enriched_sales = (
     fact_sales.alias("f")
-    .join(dim_store.alias("s"), "store_id", "left")
-    .join(dim_product.alias("p"), "product_id", "left")
-    .join(dim_customer.alias("c"), "customer_id", "left")
-    .join(dim_promotion.alias("pr"), "promotion_id", "left")
+    .join(broadcast(dim_store).alias("s"), "store_id", "left")
+    .join(broadcast(dim_product).alias("p"), "product_id", "left")
+    .join(broadcast(dim_customer).alias("c"), "customer_id", "left")
+    .join(broadcast(dim_promotion).alias("pr"), "promotion_id", "left")
     .withColumn(
         "revenue",
         F.round(
@@ -232,6 +233,15 @@ enriched_sales = (
         ),
     )
     .withColumn("cost", F.round(F.col("quantity") * F.col("unit_cost"), 2))
+)
+
+enriched_sales = (
+    enriched_sales
+    .withColumn("gross_revenue",F.col("quantity") * F.col("unit_price"))
+    .withColumn("cost", F.col("quantity") * F.col("unit_cost"))
+    .withColumn("discount_amount", F.col("gross_revenue") * F.col("discount_pct"))
+    .withColumn("net_revenue", F.col("gross_revenue") - F.col("discount_amount"))
+    .withColumn("gross_margin", F.col("net_revenue") - F.col("cost"))
 )
 
 # COMMAND ----------
