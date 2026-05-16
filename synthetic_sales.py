@@ -1,32 +1,50 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Synthetic Retail Sales Dataset
+# MAGIC # Synthetic Retail Sales Dataset — 100M-row scale build
 # MAGIC
 # MAGIC Builds a star-schema retail dataset (4 dimensions + 1 fact) using **Spark-native APIs only** —
 # MAGIC no Python loops, no `collect()`, no driver-side row construction. Everything scales horizontally.
 # MAGIC
 # MAGIC **Pattern used throughout:**
-# MAGIC - `spark.range(N)` generates the row skeleton in parallel.
-# MAGIC - `hash(col, "salt") % K` gives deterministic, repeatable categorical assignment (same input → same output across runs).
+# MAGIC - `spark.range(N, numPartitions=...)` generates the row skeleton in parallel with an explicit
+# MAGIC   partition count so we don't rely on cluster defaults — important at 100M-row scale.
+# MAGIC - `hash(col, "salt") % K` gives deterministic, repeatable categorical assignment.
 # MAGIC - `rand(seed=...)` gives reproducible numeric noise.
 # MAGIC - Foreign keys in the fact table are derived via `hash(transaction_id, salt) % dim_size + 1`,
-# MAGIC   which guarantees every FK lands inside a valid dimension key range — so joins never drop rows.
+# MAGIC   guaranteeing every FK lands inside a valid dimension key range — joins never drop rows.
+# MAGIC
+# MAGIC **Performance theme:** at 100M rows the bottlenecks shift from *generation* (CPU-bound, parallelizable)
+# MAGIC to *shuffle* (network-bound) and *write fan-out* (one task writing many partition dirs = small files).
+# MAGIC The code below is engineered around those two costs.
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 2
+# DBTITLE 1,Imports and scale configuration
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import broadcast
 
 spark = SparkSession.builder.appName("synthetic_sales").getOrCreate()
 
-# Row counts — tune these for your cluster size.
+# Row counts.
+# Dimensions are intentionally tiny so they fit comfortably under the broadcast-join threshold
+# (default spark.sql.autoBroadcastJoinThreshold = 10MB). All four dim tables together are <1MB serialized,
+# so every fact->dim join becomes a map-side broadcast join — zero shuffle.
 NUM_STORES = 200
 NUM_PRODUCTS = 5_000
 NUM_CUSTOMERS = 100_000
 NUM_PROMOTIONS = 50
-NUM_TRANSACTIONS = 1_000_000
+
+# Fact table at 100M rows.
+NUM_TRANSACTIONS = 100_000_000
+
+# Explicit partition count for fact generation.
+# Rationale: target ~500K rows per partition. At ~10 columns and mostly numeric/short-string data,
+# this lands each task around 50–100MB pre-write, which is the sweet spot for Spark task scheduling
+# (small enough to avoid GC pressure, large enough to amortize task-launch overhead).
+# 200 partitions also matches the default spark.sql.shuffle.partitions, so any downstream shuffle
+# stays balanced without us tuning shuffle.partitions separately.
+FACT_NUM_PARTITIONS = 200
 
 # COMMAND ----------
 
@@ -37,14 +55,17 @@ NUM_TRANSACTIONS = 1_000_000
 # MAGIC `element_at(array, idx)` where `idx = pmod(hash(...), len) + 1`.
 # MAGIC
 # MAGIC We salt each `hash()` call with a different literal (`"region"`, `"type"`) so the three
-# MAGIC categorical columns vary independently — otherwise every store with the same `store_id` hash
-# MAGIC bucket would land in the same country *and* region *and* type, which isn't realistic.
+# MAGIC categorical columns vary independently.
+# MAGIC
+# MAGIC **Perf:** dimensions stay on a single partition — they're tiny and we want them broadcastable
+# MAGIC without an extra coalesce step at write time.
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 4
+# DBTITLE 1,dim_store
+# numPartitions=1 — 200 rows. More partitions would just create empty tasks and metadata overhead.
 dim_store = (
-    spark.range(1, NUM_STORES + 1)
+    spark.range(1, NUM_STORES + 1, step=1, numPartitions=1)
     .withColumnRenamed("id", "store_id")
     .withColumn(
         "country",
@@ -74,13 +95,15 @@ dim_store = (
 # MAGIC %md
 # MAGIC ## 2. `dim_product`
 # MAGIC
-# MAGIC `unit_cost` is sampled uniformly in `[1.0, 191.0]` via `rand() * 190 + 1`. The seed makes the
-# MAGIC dataset reproducible — re-running the notebook gives identical costs.
+# MAGIC `unit_cost` is sampled uniformly in `[1.0, 191.0]` via `rand() * 190 + 1`. Seeded for reproducibility.
+# MAGIC
+# MAGIC **Perf:** 5K rows still fits trivially on one partition (<1MB), and keeping it that way
+# MAGIC avoids the small-files problem when the table is later read for broadcasting.
 
 # COMMAND ----------
 
 dim_product = (
-    spark.range(1, NUM_PRODUCTS + 1)
+    spark.range(1, NUM_PRODUCTS + 1, step=1, numPartitions=1)
     .withColumnRenamed("id", "product_id")
     .withColumn(
         "category",
@@ -108,13 +131,15 @@ dim_product = (
 # MAGIC ## 3. `dim_customer`
 # MAGIC
 # MAGIC `signup_date` is built by adding a deterministic day offset (0–2919, ~8 years) to a base date.
-# MAGIC Using `pmod(hash(...), 2920)` keeps the date stable per `customer_id` — useful for joins and
-# MAGIC for testing slowly-changing-dimension logic later.
+# MAGIC
+# MAGIC **Perf:** 100K rows is still well under the broadcast threshold (~3MB). We use 2 partitions
+# MAGIC purely to parallelize generation across two cores — the table coalesces back during the
+# MAGIC broadcast collect, so partition count here doesn't affect the join plan.
 
 # COMMAND ----------
 
 dim_customer = (
-    spark.range(1, NUM_CUSTOMERS + 1)
+    spark.range(1, NUM_CUSTOMERS + 1, step=1, numPartitions=2)
     .withColumnRenamed("id", "customer_id")
     .withColumn(
         "loyalty_tier",
@@ -138,8 +163,9 @@ dim_customer = (
 
 # COMMAND ----------
 
+# Single partition: 50 rows.
 dim_promotion = (
-    spark.range(1, NUM_PROMOTIONS + 1)
+    spark.range(1, NUM_PROMOTIONS + 1, step=1, numPartitions=1)
     .withColumnRenamed("id", "promotion_id")
     .withColumn(
         "promotion_type",
@@ -154,24 +180,32 @@ dim_promotion = (
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. `fact_sales`
+# MAGIC ## 5. `fact_sales` — 100M rows
 # MAGIC
-# MAGIC Generates `NUM_TRANSACTIONS` rows. Key design choices:
+# MAGIC Key design choices:
 # MAGIC
-# MAGIC - **Foreign keys** use `pmod(hash(transaction_id, salt), N) + 1`. This produces an integer in
-# MAGIC   `[1, N]` — guaranteed to match a dimension PK. Different salts per FK ensure the keys are
-# MAGIC   independent (a store's hash bucket doesn't dictate the product's hash bucket).
-# MAGIC - **`promotion_id`** is `NULL` ~70% of the time. Most real transactions aren't promoted, and
-# MAGIC   we want to test that downstream revenue math handles `NULL` discounts correctly.
-# MAGIC - **`transaction_ts`** is a deterministic timestamp anywhere in calendar year 2024. We add a
-# MAGIC   number of seconds (0 to 31,536,000 = 365 days) to a fixed midnight base.
-# MAGIC - **`transaction_date`** is derived from the timestamp and used as the partition column.
+# MAGIC - **Foreign keys** use `pmod(hash(transaction_id, salt), N) + 1`. Different salts per FK ensure
+# MAGIC   keys are independent across dimensions.
+# MAGIC - **`promotion_id`** is `NULL` ~70% of the time (most real transactions aren't promoted).
+# MAGIC - **`transaction_ts`** is a deterministic timestamp anywhere in calendar year 2024.
+# MAGIC - **`transaction_date`** is the partition column for the Delta write.
+# MAGIC
+# MAGIC **Perf at 100M scale:**
+# MAGIC - `numPartitions=FACT_NUM_PARTITIONS` (200) gives us ~500K rows per task. Without an explicit
+# MAGIC   value, `spark.range` uses `spark.default.parallelism`, which is cluster-dependent and often
+# MAGIC   too low (under-utilizing cores) or too high (small-task overhead) for this dataset size.
+# MAGIC - All columns are pure expressions over `transaction_id` plus a few seeded `rand()` calls —
+# MAGIC   no shuffle, no UDFs. The whole stage is narrow and pipelined.
+# MAGIC - We do NOT cache the fact DataFrame: it's a single linear pipeline that's read exactly twice
+# MAGIC   (once for the unenriched `fact_sales` write, once for the enriched join). Caching 100M rows
+# MAGIC   would cost more memory than the recomputation costs CPU.
 
 # COMMAND ----------
 
 fact_sales = (
-    spark.range(1, NUM_TRANSACTIONS + 1)
+    spark.range(1, NUM_TRANSACTIONS + 1, step=1, numPartitions=FACT_NUM_PARTITIONS)
     .withColumnRenamed("id", "transaction_id")
+    # Foreign keys: deterministic, uniformly distributed across each dim's PK range.
     .withColumn(
         "store_id",
         F.pmod(F.hash(F.col("transaction_id"), F.lit("s")), F.lit(NUM_STORES)) + F.lit(1),
@@ -206,59 +240,122 @@ fact_sales = (
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Enrichment: join fact to dimensions, compute revenue & cost
+# MAGIC ## 6. Enrichment: project, then join, then compute
 # MAGIC
-# MAGIC All joins are `LEFT` so we keep every fact row even if a key is missing (only `promotion_id`
-# MAGIC can legitimately be `NULL` here, but using LEFT is defensive).
+# MAGIC **Perf rules applied here:**
 # MAGIC
-# MAGIC - **`revenue` = `quantity * unit_price * (1 - discount_pct)`**, with `coalesce(discount_pct, 0)`
-# MAGIC   so unpromoted transactions get full price.
-# MAGIC - **`cost` = `quantity * unit_cost`** — `unit_cost` comes from `dim_product`.
+# MAGIC 1. **Project before join.** We `select(...)` only the columns each dim contributes to the
+# MAGIC    enrichment. `dim_store` carries 4 columns total but the fact only needs `country`, `region`,
+# MAGIC    `store_type` — dropping `store_id` from the projection keeps the join key but trims the
+# MAGIC    broadcast payload. Same idea for the other dims. Smaller broadcasts = less serialization,
+# MAGIC    less network, less executor memory pressure.
+# MAGIC 2. **Explicit `broadcast(...)` hints.** Even though dims are well under the auto-broadcast
+# MAGIC    threshold, the hint is defensive: if a future change pushes a dim past the threshold, the
+# MAGIC    plan would silently degrade to a sort-merge join (full shuffle of the 100M-row fact). The
+# MAGIC    hint forces a broadcast hash join and surfaces the problem as an OOM instead of silent
+# MAGIC    slowdown.
+# MAGIC 3. **`LEFT` joins.** Defensive — keep every fact row even if a key is unexpectedly missing.
+# MAGIC    Only `promotion_id` is legitimately nullable.
+# MAGIC 4. **All numeric columns derived in one pass.** `gross_revenue`, `discount_amount`,
+# MAGIC    `net_revenue`, `cost`, `gross_margin` are all computed in a single projection. Spark's
+# MAGIC    Catalyst optimizer collapses chained `withColumn` calls into one project node anyway,
+# MAGIC    but keeping them in one block makes the dependency chain explicit to readers.
 
 # COMMAND ----------
 
-enriched_sales = (
-    fact_sales.alias("f")
-    .join(broadcast(dim_store).alias("s"), "store_id", "left")
-    .join(broadcast(dim_product).alias("p"), "product_id", "left")
-    .join(broadcast(dim_customer).alias("c"), "customer_id", "left")
-    .join(broadcast(dim_promotion).alias("pr"), "promotion_id", "left")
-    .withColumn(
-        "revenue",
-        F.round(
-            F.col("quantity")
-            * F.col("unit_price")
-            * (F.lit(1.0) - F.coalesce(F.col("discount_pct"), F.lit(0.0))),
-            2,
-        ),
-    )
-    .withColumn("cost", F.round(F.col("quantity") * F.col("unit_cost"), 2))
-)
+# Project each dim down to (join_key + only the columns enrichment needs).
+# This shrinks the broadcast hash table on every executor — at 100M-row scale, broadcast payload size
+# directly impacts executor heap pressure during the join.
+dim_store_min = dim_store.select("store_id", "country", "region", "store_type")
+dim_product_min = dim_product.select("product_id", "category", "brand", "unit_cost")
+# dim_customer's "signup_date" isn't needed downstream by the metrics notebook, so drop it from the
+# broadcast. We keep "loyalty_tier" since it's a common slicing dimension for retail metrics.
+dim_customer_min = dim_customer.select("customer_id", "loyalty_tier")
+dim_promotion_min = dim_promotion.select("promotion_id", "promotion_type", "discount_pct")
 
 enriched_sales = (
-    enriched_sales
-    .withColumn("gross_revenue",F.col("quantity") * F.col("unit_price"))
-    .withColumn("cost", F.col("quantity") * F.col("unit_cost"))
-    .withColumn("discount_amount", F.col("gross_revenue") * F.col("discount_pct"))
-    .withColumn("net_revenue", F.col("gross_revenue") - F.col("discount_amount"))
-    .withColumn("gross_margin", F.col("net_revenue") - F.col("cost"))
+    fact_sales.alias("f")
+    .join(broadcast(dim_store_min).alias("s"), "store_id", "left")
+    .join(broadcast(dim_product_min).alias("p"), "product_id", "left")
+    .join(broadcast(dim_customer_min).alias("c"), "customer_id", "left")
+    .join(broadcast(dim_promotion_min).alias("pr"), "promotion_id", "left")
+    # Single projection block — Catalyst fuses these into one Project node.
+    # `coalesce(discount_pct, 0)` so unpromoted transactions (NULL discount) get full price math.
+    .withColumn("gross_revenue", F.round(F.col("quantity") * F.col("unit_price"), 2))
+    .withColumn("cost", F.round(F.col("quantity") * F.col("unit_cost"), 2))
+    .withColumn(
+        "discount_amount",
+        F.round(F.col("gross_revenue") * F.coalesce(F.col("discount_pct"), F.lit(0.0)), 2),
+    )
+    .withColumn("net_revenue", F.round(F.col("gross_revenue") - F.col("discount_amount"), 2))
+    .withColumn("gross_margin", F.round(F.col("net_revenue") - F.col("cost"), 2))
 )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Persist as managed tables
+# MAGIC ## 7. Persist as Delta tables
 # MAGIC
-# MAGIC Fact tables are partitioned by `transaction_date` for efficient date-range pruning.
+# MAGIC **`fact_sales` is partitioned by `transaction_date`** (365 daily partitions across CY2024).
+# MAGIC Date-range filters in the metrics notebook will partition-prune, reading only the days they need.
+# MAGIC
+# MAGIC **Perf rules applied to the write:**
+# MAGIC
+# MAGIC 1. **`format("delta")`** explicitly — Delta gives us partition pruning, file statistics for
+# MAGIC    data skipping on non-partition columns, and `OPTIMIZE`/`ZORDER` later if needed.
+# MAGIC 2. **`repartition("transaction_date")` before write.** Without this, each of our 200 generation
+# MAGIC    tasks would write to all 365 date partitions, producing 200 × 365 = 73,000 small files.
+# MAGIC    Repartitioning by `transaction_date` collapses each date to a single task, so the write
+# MAGIC    produces ~365 files (one per day) of ~250–300MB each — a healthy file size for Delta.
+# MAGIC 3. **`mode("overwrite")` with `overwriteSchema=true`** so re-runs with schema changes don't
+# MAGIC    fail on a column drift between iterations of this notebook.
+# MAGIC 4. **Dimensions write without partitioning** — they're too small to partition meaningfully.
+# MAGIC    A single Delta file per dim is ideal.
 
 # COMMAND ----------
 
-dim_store.write.mode("overwrite").saveAsTable("dim_store")
-dim_product.write.mode("overwrite").saveAsTable("dim_product")
-dim_customer.write.mode("overwrite").saveAsTable("dim_customer")
-dim_promotion.write.mode("overwrite").saveAsTable("dim_promotion")
-fact_sales.write.mode("overwrite").partitionBy("transaction_date").saveAsTable("fact_sales")
-enriched_sales.write.mode("overwrite").partitionBy("transaction_date").saveAsTable("fact_sales_enriched")
+# Dimensions: small, single-file Delta writes. No partitioning, no repartitioning needed.
+(dim_store.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_store"))
+(dim_product.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_product"))
+(dim_customer.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_customer"))
+(dim_promotion.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_promotion"))
+
+# fact_sales: repartition by transaction_date BEFORE write to avoid the 200×365 small-files explosion.
+# This costs one shuffle, but the shuffle is cheap relative to the file-system cost of writing,
+# committing, and later reading 73,000 tiny files.
+(
+    fact_sales
+    .repartition("transaction_date")
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .partitionBy("transaction_date")
+    .saveAsTable("fact_sales")
+)
+
+# fact_sales_enriched: same partitioning strategy. The metrics notebook reads this table and
+# groups by transaction_date / region / category — date partitioning enables pruning for any
+# date-bounded metric, and Delta's per-file min/max stats handle the rest.
+(
+    enriched_sales
+    .repartition("transaction_date")
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .partitionBy("transaction_date")
+    .saveAsTable("fact_sales_enriched")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8. Sanity-check displays
+# MAGIC
+# MAGIC `display()` on a 100M-row Delta table is safe — Databricks samples/limits the preview rather
+# MAGIC than materializing the full table to the driver. We deliberately do NOT call `.collect()` or
+# MAGIC `.toPandas()` anywhere in this notebook.
 
 # COMMAND ----------
 
