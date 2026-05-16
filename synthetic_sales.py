@@ -186,6 +186,11 @@ dim_promotion = (
 # MAGIC
 # MAGIC - **Foreign keys** use `pmod(hash(transaction_id, salt), N) + 1`. Different salts per FK ensure
 # MAGIC   keys are independent across dimensions.
+# MAGIC - **`store_id` is DELIBERATELY SKEWED.** ~50% of transactions land on `store_id = 1` (a "flagship"
+# MAGIC   hot key); the remaining ~50% are uniformly distributed across stores 2..200. This simulates a
+# MAGIC   real retail pattern (one mega-store dominating volume) and gives the metrics notebook a
+# MAGIC   concrete case study for skew detection and salted aggregation. Without this, every store would
+# MAGIC   have ~0.5% of rows and skew-handling techniques would be unmotivated.
 # MAGIC - **`promotion_id`** is `NULL` ~70% of the time (most real transactions aren't promoted).
 # MAGIC - **`transaction_ts`** is a deterministic timestamp anywhere in calendar year 2024.
 # MAGIC - **`transaction_date`** is the partition column for the Delta write.
@@ -206,9 +211,19 @@ fact_sales = (
     spark.range(1, NUM_TRANSACTIONS + 1, step=1, numPartitions=FACT_NUM_PARTITIONS)
     .withColumnRenamed("id", "transaction_id")
     # Foreign keys: deterministic, uniformly distributed across each dim's PK range.
+    # store_id: deliberately skewed. With prob ~0.5 the row goes to store_id=1 (the hot key);
+    # otherwise it's uniformly distributed across stores 2..NUM_STORES. The seeded rand() makes
+    # the skew reproducible across runs. Result: ~50M rows on store 1, ~50M rows spread across
+    # 199 other stores (~250K each). This is the workload that motivates salted aggregation
+    # in the metrics notebook.
     .withColumn(
         "store_id",
-        F.pmod(F.hash(F.col("transaction_id"), F.lit("s")), F.lit(NUM_STORES)) + F.lit(1),
+        F.when(
+            F.rand(seed=77) < F.lit(0.5),
+            F.lit(1).cast("long"),
+        ).otherwise(
+            (F.pmod(F.hash(F.col("transaction_id"), F.lit("s")), F.lit(NUM_STORES - 1)) + F.lit(2)).cast("long")
+        ),
     )
     .withColumn(
         "product_id",
