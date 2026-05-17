@@ -337,11 +337,12 @@ fact_sales = fact_sales.filter(
 # MAGIC 2. **Mixed join strategies — broadcast for tiny dims, SortMergeJoin for `dim_customer`.**
 # MAGIC    `dim_store` / `dim_product` / `dim_promotion` are all <1MB → `broadcast()` hints force a
 # MAGIC    BroadcastHashJoin (no fact-side shuffle). `dim_customer` at 200M rows ≈ 6GB CANNOT be
-# MAGIC    broadcast — we'd OOM the driver collect and the executor heap. Instead we let Catalyst
-# MAGIC    pick SortMergeJoin (both sides shuffled and sorted by `customer_id`). Crucially, both
-# MAGIC    `fact_sales` and `dim_customer` are **bucketed on `customer_id`** at write time (see
-# MAGIC    section 7), which lets the SortMergeJoin skip the shuffle/sort phase entirely on subsequent
-# MAGIC    reads — files already co-locate matching keys.
+# MAGIC    broadcast — we'd OOM the driver collect and the executor heap. Catalyst picks SortMergeJoin
+# MAGIC    (both sides shuffled and sorted by `customer_id`). Note: Delta tables do not support Hive
+# MAGIC    bucketing, so the customer↔fact join reshuffles on every read. Z-ORDER on `customer_id`
+# MAGIC    (via `OPTIMIZE ... ZORDER BY`) helps with data skipping but does NOT eliminate the SMJ
+# MAGIC    shuffle. This is a Delta tradeoff vs. the Parquet/Hive design — still acceptable here
+# MAGIC    because the enrichment runs once at table-build time, not per query.
 # MAGIC 3. **The defensive `broadcast()` hint logic still applies for the small dims.** If a future
 # MAGIC    change pushes one of them past the auto-broadcast threshold, the plan would silently
 # MAGIC    degrade to a SortMergeJoin (full shuffle of the 100M-row fact). The hint forces a broadcast
@@ -393,103 +394,84 @@ enriched_sales = (
 # MAGIC %md
 # MAGIC ## 7. Persist as Delta tables
 # MAGIC
-# MAGIC **`fact_sales` is partitioned by `transaction_date`** (365 daily partitions across CY2024)
-# MAGIC AND **bucketed by `customer_id`** into `NUM_BUCKETS` files per date partition. `dim_customer`
-# MAGIC is bucketed identically. This is the key change driven by the 200M-row dim_customer.
+# MAGIC **`fact_sales` is partitioned by `transaction_date`** (365 daily partitions across CY2024).
+# MAGIC `dim_customer` and the small dims are written unpartitioned.
 # MAGIC
-# MAGIC **Why bucket on `customer_id`:** the fact↔dim_customer SortMergeJoin would otherwise need to
-# MAGIC shuffle BOTH the 100M-row fact AND the 200M-row dim by `customer_id` on every read — that's
-# MAGIC ~10–15GB of shuffle for the fact + ~6GB for the dim, every single query. Bucketing both
-# MAGIC tables on the same key, into the same number of buckets, with the same hash function, lets
-# MAGIC Spark recognize at plan time that matching keys are already co-located. The join plan changes
-# MAGIC from `Exchange → Sort → SortMergeJoin → Exchange → Sort` (per side) to just `SortMergeJoin`
-# MAGIC over pre-bucketed inputs — no shuffle, no sort.
+# MAGIC **About bucketing:** an earlier version of this notebook used Hive-style `bucketBy("customer_id")`
+# MAGIC on both `fact_sales` and `dim_customer` so the SortMergeJoin could skip its shuffle phase. That
+# MAGIC strategy doesn't work on Delta — `bucketBy()` raises `[DELTA_OPERATION_NOT_ALLOWED] Bucketing
+# MAGIC is not supported for Delta tables` because Delta uses its own file layout and statistics
+# MAGIC mechanism rather than Hive bucketing.
 # MAGIC
-# MAGIC **Choosing `NUM_BUCKETS`:** rule of thumb is bucket count × avg file size ≈ healthy file size
-# MAGIC (~256MB). 200M customer rows × ~30 bytes = 6GB → 6GB / 256MB ≈ 24 buckets. We round to 32
-# MAGIC (a power of two helps the hash partitioner spread evenly). Both tables MUST use the same
-# MAGIC bucket count or Spark falls back to a re-shuffle.
+# MAGIC **Delta-native alternatives** (NOT applied here, listed for reference):
+# MAGIC - `OPTIMIZE <table> ZORDER BY (customer_id)` — clusters files by `customer_id` for data
+# MAGIC   skipping. This helps point lookups and range filters but does NOT eliminate the join-time
+# MAGIC   shuffle. Catalyst still issues `Exchange hashpartitioning(customer_id, N)` on both sides.
+# MAGIC - **Liquid Clustering** (`CLUSTER BY (customer_id)`) — newer Databricks feature, similar
+# MAGIC   data-skipping benefit, also doesn't replace bucketed-join shuffle skipping.
+# MAGIC - **Pre-aggregating** customer-level features in a separate notebook (this is what
+# MAGIC   `ml_features.ipynb` does — it shuffles once per build, then downstream consumers read a
+# MAGIC   pre-aggregated 200K-row table).
+# MAGIC
+# MAGIC We accept the per-query shuffle here because the enrichment join runs once at table-build
+# MAGIC time, and downstream notebooks read the pre-enriched `fact_sales_enriched` table directly.
 # MAGIC
 # MAGIC **Other perf rules:**
 # MAGIC
 # MAGIC 1. **`format("delta")`** explicitly — Delta gives us partition pruning, file statistics for
 # MAGIC    data skipping on non-partition columns, and `OPTIMIZE`/`ZORDER` later if needed.
-# MAGIC 2. **`repartition("transaction_date", "customer_id")` before write.** With bucketing layered
-# MAGIC    on top of date partitioning, we want each writer task to handle exactly one
-# MAGIC    `(transaction_date, bucket)` slot. Repartitioning by both columns aligns the in-memory
-# MAGIC    layout with the on-disk layout and avoids the small-files explosion.
+# MAGIC 2. **`repartition("transaction_date")` before write.** Aligns the in-memory layout with the
+# MAGIC    on-disk partition layout — each writer task handles exactly one date partition, avoiding
+# MAGIC    scatter writes (multiple tasks writing to the same date dir, producing many small files).
 # MAGIC 3. **`mode("overwrite")` with `overwriteSchema=true`** so re-runs with schema changes don't
-# MAGIC    fail on a column drift between iterations of this notebook.
-# MAGIC 4. **Small dims (`dim_store`, `dim_product`, `dim_promotion`) write without partitioning or
-# MAGIC    bucketing** — they're tiny enough to broadcast at query time. Bucketing them would be
-# MAGIC    pure overhead.
+# MAGIC    fail on column drift between iterations of this notebook.
+# MAGIC 4. **Small dims (`dim_store`, `dim_product`, `dim_promotion`) write without partitioning** —
+# MAGIC    they're tiny enough to broadcast at query time.
 
 # COMMAND ----------
 
-# DBTITLE 1,Bucketing configuration for customer_id co-location
-# Both fact_sales and dim_customer use the same bucket count on customer_id so SortMergeJoin
-# can skip the shuffle phase on read. Changing this value requires re-writing BOTH tables.
-NUM_BUCKETS = 32
-
-# COMMAND ----------
-
-# Small dims: single-file Delta writes. No partitioning, no bucketing needed.
+# Small dims: single-file Delta writes. No partitioning needed.
 (dim_store.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_store"))
 (dim_product.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_product"))
 (dim_promotion.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("dim_promotion"))
 
-# dim_customer: 200M rows, bucketed on customer_id so fact↔customer SMJ can skip the shuffle.
-# Note: Spark's bucketBy is only respected on the Hive metastore path (saveAsTable), not on
-# path-based saves — that's why we use saveAsTable here even though Delta is the file format.
-# Repartitioning by customer_id before the write aligns the in-memory layout with the bucket
-# layout, so each writer task produces exactly one bucket file (no scatter writes).
+# dim_customer: 200M rows. We can't bucket on Delta, so we just persist it as a flat Delta table.
+# Downstream joins to this table will reshuffle on customer_id — acceptable here because the
+# fact↔customer enrichment runs once at table build time, not per query.
 (
     dim_customer
-    .repartition(NUM_BUCKETS, "customer_id")
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .bucketBy(NUM_BUCKETS, "customer_id")
-    .sortBy("customer_id")  # within-bucket sort lets SMJ stream pre-sorted partitions
     .saveAsTable("dim_customer")
 )
 
-# fact_sales: partition by transaction_date AND bucket by customer_id.
-# Layered partitioning + bucketing: 365 date partitions × 32 customer buckets = 11,680 logical
-# slots. Each slot becomes one Delta file of ~30-40MB (100M rows × ~50 bytes / 11,680). That's
-# on the small side for Delta, but the trade-off is worth it: the alternative is a per-query
-# shuffle of 5-10GB on the customer_id join.
-#
-# Repartitioning by (transaction_date, customer_id) before the write aligns the in-memory
-# layout with the on-disk layout — each task writes to exactly one (date, bucket) slot.
+# fact_sales: partition by transaction_date.
+# Repartitioning by transaction_date before the write aligns the in-memory layout with the
+# on-disk partition layout — each writer task produces files for exactly one date.
 (
     fact_sales
-    .repartition("transaction_date", "customer_id")
+    .repartition("transaction_date")
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("transaction_date")
-    .bucketBy(NUM_BUCKETS, "customer_id")
-    .sortBy("customer_id")
     .saveAsTable("fact_sales")
 )
 
-# fact_sales_enriched: same partition + bucket strategy as fact_sales. The metrics notebook
-# reads this table and groups by transaction_date / region / category / loyalty_tier — date
-# partitioning enables pruning for date-bounded metrics, customer_id bucketing means any
-# downstream join back to dim_customer (or to another customer-keyed table) skips the shuffle.
+# fact_sales_enriched: same partition strategy as fact_sales. The metrics notebook reads this
+# table and groups by transaction_date / region / category / loyalty_tier — date partitioning
+# enables pruning for date-bounded metrics.
 (
     enriched_sales
-    .repartition("transaction_date", "customer_id")
+    .repartition("transaction_date")
     .write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("transaction_date")
-    .bucketBy(NUM_BUCKETS, "customer_id")
-    .sortBy("customer_id")
     .saveAsTable("fact_sales_enriched")
 )
 
