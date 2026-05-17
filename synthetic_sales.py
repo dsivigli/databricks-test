@@ -54,6 +54,28 @@ NUM_TRANSACTIONS = 100_000_000
 # stays balanced without us tuning shuffle.partitions separately.
 FACT_NUM_PARTITIONS = 200
 
+# Churn-injection knobs.
+# A deterministic CHURNER_FRACTION of customers is treated as "churners": their transactions
+# after MID_YEAR_CUTOFF are dropped at the fact-table level. This creates a real engagement→
+# churn relationship in the synthetic data so downstream models (ml_model.ipynb) actually have
+# something learnable.
+#
+# Two signals are produced:
+# 1. Recency. Churners' max transaction_date lands in H1; non-churners are spread across the
+#    full year. days_since_last_purchase becomes bimodal instead of near-constant — the
+#    rank-based churn label in ml_model.ipynb then picks out churners cleanly.
+# 2. Engagement. Transaction timestamps are uniform across the year, so dropping post-cutoff
+#    rows removes ~50% of each churner's transactions. Aggregate features (transaction_count,
+#    total_revenue, total_quantity, distinct_brands, ...) end up roughly half the magnitude
+#    for churners — giving the model real signal even when days_since_last_purchase is
+#    excluded from feature_cols (as it must be, since the label is derived from it).
+#
+# Churner status is determined from customer_id (not transaction_id) so all of a customer's
+# transactions are treated consistently — without that, churn assignment would be per-row and
+# the engagement-feature signal would average out to zero.
+CHURNER_FRACTION = 0.20
+MID_YEAR_CUTOFF = "2024-07-01"
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -268,6 +290,36 @@ fact_sales = (
         ),
     )
     .withColumn("transaction_date", F.to_date("transaction_ts"))
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 5a. Churn injection
+# MAGIC
+# MAGIC Drop H2 transactions for the deterministic ~20% of customers flagged as churners. After this
+# MAGIC filter, churners only have H1 transactions (so `days_since_last_purchase` ≥ ~6 months at
+# MAGIC year-end) AND ~50% fewer transactions overall — both signals are now real in the data.
+# MAGIC
+# MAGIC **Why this is a `filter` and not a per-row drop:** churner status must be customer-scoped, not
+# MAGIC transaction-scoped. `pmod(hash(customer_id, "churn"), 100) < 20` is deterministic in the
+# MAGIC customer key, so every transaction belonging to a given churner is filtered consistently.
+# MAGIC Hashing on `transaction_id` instead would randomly drop ~20% of every customer's transactions
+# MAGIC and the "fewer transactions per customer" signal would wash out to zero.
+# MAGIC
+# MAGIC **Perf:** the filter is a narrow transformation. It pushes down before any join in section 6
+# MAGIC (Catalyst will reorder Filter below the broadcast joins automatically), so the joins see a
+# MAGIC smaller fact-side input. Final fact_sales row count drops from 100M to ~90M
+# MAGIC (100M × (1 − 0.20 × 0.50) = 90M).
+
+# COMMAND ----------
+
+fact_sales = fact_sales.filter(
+    # Keep the row if EITHER the customer isn't a churner OR the transaction is before the cutoff.
+    # pmod(hash(customer_id, 'churn'), 100) < (CHURNER_FRACTION * 100) is the customer-side
+    # churner indicator; deterministic given the same customer_id.
+    (F.pmod(F.hash(F.col("customer_id"), F.lit("churn")), F.lit(100)) >= F.lit(int(CHURNER_FRACTION * 100)))
+    | (F.col("transaction_date") < F.lit(MID_YEAR_CUTOFF))
 )
 
 # COMMAND ----------
